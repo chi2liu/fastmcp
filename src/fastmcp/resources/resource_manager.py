@@ -79,7 +79,9 @@ class ResourceManager:
         """
         all_resources: dict[str, Resource] = {}
 
-        for mounted in self._mounted_servers:
+        # Optimize resource gathering by fetching from all mounted servers in parallel
+        async def fetch_server_resources(mounted) -> dict[str, Resource] | None:
+            """Fetch resources from a single mounted server with error handling."""
             try:
                 if via_server:
                     # Use the server-to-server filtered path
@@ -97,21 +99,38 @@ class ResourceManager:
                 if mounted.prefix:
                     from fastmcp.server.server import add_resource_prefix
 
+                    prefixed_resources = {}
                     for uri, resource in child_resources.items():
                         prefixed_uri = add_resource_prefix(
                             uri, mounted.prefix, mounted.resource_prefix_format
                         )
                         # Create a copy of the resource with the prefixed key
                         prefixed_resource = resource.with_key(prefixed_uri)
-                        all_resources[prefixed_uri] = prefixed_resource
+                        prefixed_resources[prefixed_uri] = prefixed_resource
+                    return prefixed_resources
                 else:
-                    all_resources.update(child_resources)
+                    return child_resources
             except Exception as e:
-                # Skip failed mounts silently, matches existing behavior
+                # Log error but don't fail the entire operation
                 logger.warning(
                     f"Failed to get resources from server: {mounted.server.name!r}, mounted at: {mounted.prefix!r}: {e}"
                 )
-                continue
+                return None
+
+        # Fetch resources from all mounted servers concurrently
+        if self._mounted_servers:
+            import asyncio
+
+            server_results = await asyncio.gather(
+                *[fetch_server_resources(mounted) for mounted in self._mounted_servers],
+                return_exceptions=True,
+            )
+
+            # Merge results from all servers
+            for result in server_results:
+                if isinstance(result, dict):  # Successful result
+                    all_resources.update(result)
+                # Exceptions are already logged in fetch_server_resources
 
         # Finally, add local resources, which always take precedence
         all_resources.update(self._resources)
