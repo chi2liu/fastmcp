@@ -1,3 +1,5 @@
+"""Refactored ToolManager using BaseManager."""
+
 from __future__ import annotations
 
 import warnings
@@ -7,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from mcp.types import ToolAnnotations
 
 from fastmcp import settings
+from fastmcp.base_manager import BaseManager
 from fastmcp.exceptions import NotFoundError, ToolError
 from fastmcp.settings import DuplicateBehavior
 from fastmcp.tools.tool import Tool, ToolResult
@@ -22,7 +25,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-class ToolManager:
+class ToolManager(BaseManager[Tool]):
     """Manages FastMCP tools."""
 
     def __init__(
@@ -31,100 +34,51 @@ class ToolManager:
         mask_error_details: bool | None = None,
         transformations: dict[str, ToolTransformConfig] | None = None,
     ):
-        self._tools: dict[str, Tool] = {}
-        self._mounted_servers: list[MountedServer] = []
-        self.mask_error_details = mask_error_details or settings.mask_error_details
+        super().__init__(duplicate_behavior, mask_error_details)
         self.transformations = transformations or {}
 
-        # Default to "warn" if None is provided
-        if duplicate_behavior is None:
-            duplicate_behavior = "warn"
+    def get_item_type_name(self) -> str:
+        return "tool"
 
-        if duplicate_behavior not in DuplicateBehavior.__args__:
-            raise ValueError(
-                f"Invalid duplicate_behavior: {duplicate_behavior}. "
-                f"Must be one of: {', '.join(DuplicateBehavior.__args__)}"
+    def get_item_type_plural(self) -> str:
+        return "tools"
+
+    async def fetch_items_from_mounted_server(
+        self, server: Any, via_server: bool
+    ) -> list[Tool]:
+        if via_server:
+            # Use the server-to-server filtered path
+            return await server._list_tools()
+        else:
+            # Use the manager-to-manager unfiltered path
+            return await server._tool_manager.list_tools()
+
+    def get_item_key(self, item: Tool) -> str:
+        return item.key
+
+    def apply_prefix_to_items(
+        self, items: dict[str, Tool], mounted: MountedServer
+    ) -> dict[str, Tool]:
+        prefixed_tools = {}
+        for tool in items.values():
+            prefixed_tool = tool.model_copy(
+                update={"key": f"{mounted.prefix}_{tool.key}"}
             )
+            prefixed_tools[prefixed_tool.key] = prefixed_tool
+        return prefixed_tools
 
-        self.duplicate_behavior = duplicate_behavior
+    def post_process_items(self, items: dict[str, Tool]) -> dict[str, Tool]:
+        if not self.transformations:
+            return items
 
-    def mount(self, server: MountedServer) -> None:
-        """Adds a mounted server as a source for tools."""
-        self._mounted_servers.append(server)
-
-    async def _load_tools(self, *, via_server: bool = False) -> dict[str, Tool]:
-        """
-        The single, consolidated recursive method for fetching tools. The 'via_server'
-        parameter determines the communication path.
-
-        - via_server=False: Manager-to-manager path for complete, unfiltered inventory
-        - via_server=True: Server-to-server path for filtered MCP requests
-        """
-        all_tools: dict[str, Tool] = {}
-
-        for mounted in self._mounted_servers:
-            try:
-                if via_server:
-                    # Use the server-to-server filtered path
-                    child_results = await mounted.server._list_tools()
-                else:
-                    # Use the manager-to-manager unfiltered path
-                    child_results = await mounted.server._tool_manager.list_tools()
-
-                # The combination logic is the same for both paths
-                child_dict = {t.key: t for t in child_results}
-                if mounted.prefix:
-                    for tool in child_dict.values():
-                        prefixed_tool = tool.with_key(f"{mounted.prefix}_{tool.key}")
-                        all_tools[prefixed_tool.key] = prefixed_tool
-                else:
-                    all_tools.update(child_dict)
-            except Exception as e:
-                # Skip failed mounts silently, matches existing behavior
-                logger.warning(
-                    f"Failed to get tools from server: {mounted.server.name!r}, mounted at: {mounted.prefix!r}: {e}"
-                )
-                continue
-
-        # Finally, add local tools, which always take precedence
-        all_tools.update(self._tools)
-
-        transformed_tools = apply_transformations_to_tools(
-            tools=all_tools,
+        return apply_transformations_to_tools(
+            tools=items,
             transformations=self.transformations,
         )
 
-        return transformed_tools
-
-    async def has_tool(self, key: str) -> bool:
-        """Check if a tool exists."""
-        tools = await self.get_tools()
-        return key in tools
-
-    async def get_tool(self, key: str) -> Tool:
-        """Get tool by key."""
-        tools = await self.get_tools()
-        if key in tools:
-            return tools[key]
-        raise NotFoundError(f"Tool {key!r} not found")
-
-    async def get_tools(self) -> dict[str, Tool]:
-        """
-        Gets the complete, unfiltered inventory of all tools.
-        """
-        return await self._load_tools(via_server=False)
-
-    async def list_tools(self) -> list[Tool]:
-        """
-        Lists all tools, applying protocol filtering.
-        """
-        tools_dict = await self._load_tools(via_server=True)
-        return list(tools_dict.values())
-
     @property
     def _tools_transformed(self) -> list[str]:
-        """Get the local tools."""
-
+        """Get the list of transformed tool names."""
         return [
             transformation.name or tool_name
             for tool_name, transformation in self.transformations.items()
@@ -140,111 +94,126 @@ class ToolManager:
         serializer: Callable[[Any], str] | None = None,
         exclude_args: list[str] | None = None,
     ) -> Tool:
-        """Add a tool to the server."""
-        # deprecated in 2.7.0
+        """Add a tool from a function."""
         if settings.deprecation_warnings:
             warnings.warn(
-                "ToolManager.add_tool_from_fn() is deprecated. Use Tool.from_function() and call add_tool() instead.",
+                "ToolManager.add_tool_from_fn() is deprecated. "
+                "Use Tool.from_function() and call add_tool() instead.",
                 DeprecationWarning,
                 stacklevel=2,
             )
+
         tool = Tool.from_function(
-            fn,
+            fn=fn,
             name=name,
             description=description,
             tags=tags,
             annotations=annotations,
-            exclude_args=exclude_args,
             serializer=serializer,
+            exclude_args=exclude_args,
         )
         return self.add_tool(tool)
 
     def add_tool(self, tool: Tool) -> Tool:
         """Register a tool with the server."""
-        existing = self._tools.get(tool.key)
-        if existing:
-            if self.duplicate_behavior == "warn":
-                logger.warning(f"Tool already exists: {tool.key}")
-                self._tools[tool.key] = tool
-            elif self.duplicate_behavior == "replace":
-                self._tools[tool.key] = tool
-            elif self.duplicate_behavior == "error":
-                raise ValueError(f"Tool already exists: {tool.key}")
-            elif self.duplicate_behavior == "ignore":
-                return existing
-        else:
-            self._tools[tool.key] = tool
-        return tool
-
-    def add_tool_transformation(
-        self, tool_name: str, transformation: ToolTransformConfig
-    ) -> None:
-        """Add a tool transformation."""
-        self.transformations[tool_name] = transformation
-
-    def get_tool_transformation(self, tool_name: str) -> ToolTransformConfig | None:
-        """Get a tool transformation."""
-        return self.transformations.get(tool_name)
-
-    def remove_tool_transformation(self, tool_name: str) -> None:
-        """Remove a tool transformation."""
-        if tool_name in self.transformations:
-            del self.transformations[tool_name]
+        return self.add_item(tool)
 
     def remove_tool(self, key: str) -> None:
-        """Remove a tool from the server.
+        """Remove a tool from the manager."""
+        if key not in self._items:
+            raise NotFoundError(f"Tool '{key}' not found")
+        del self._items[key]
+
+    async def has_tool(self, key: str) -> bool:
+        """Check if a tool exists."""
+        return await self.has_item(key)
+
+    async def get_tool(self, key: str) -> Tool:
+        """Get a tool by key."""
+        return await self.get_item(key)
+
+    async def get_tools(self) -> dict[str, Tool]:
+        """Get all tools as a dictionary."""
+        return await self.get_items()
+
+    async def list_tools(self) -> list[Tool]:
+        """List all tools."""
+        return await self.list_items()
+
+    async def call_tool(
+        self,
+        key: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        """
+        Call a tool by key with the given arguments.
+
+        This is tool-specific functionality for executing tools.
 
         Args:
-            key: The key of the tool to remove
+            key: The tool key
+            arguments: The arguments to pass to the tool
+
+        Returns:
+            The tool execution result
 
         Raises:
-            NotFoundError: If the tool is not found
+            ToolError: If there's an error calling the tool
         """
-        if key in self._tools:
-            del self._tools[key]
-        else:
-            raise NotFoundError(f"Tool {key!r} not found")
+        tool = await self.get_tool(key)
 
-    async def call_tool(self, key: str, arguments: dict[str, Any]) -> ToolResult:
+        try:
+            # Delegate to the tool's run method
+            return await tool.run(arguments or {})
+        except ToolError:
+            # Re-raise ToolError as-is
+            raise
+        except Exception as e:
+            # Wrap other exceptions based on mask_error_details setting
+            if self.mask_error_details:
+                raise ToolError(f"Error calling tool {key!r}") from e
+            else:
+                raise ToolError(f"Error calling tool {key!r}: {e}") from e
+
+    async def handle_call_tool_request(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> list[Any]:
         """
-        Internal API for servers: Finds and calls a tool, respecting the
-        filtered protocol path.
+        Handle an MCP tools/call request.
+
+        This method is called by the server to process tool calls
+        from the MCP protocol.
+
+        Args:
+            name: The tool name
+            arguments: The tool arguments
+
+        Returns:
+            The tool result formatted for MCP response
         """
-        # 1. Check local tools first. The server will have already applied its filter.
-        if key in self._tools or key in self._tools_transformed:
-            tool = await self.get_tool(key)
-            if not tool:
-                raise NotFoundError(f"Tool {key!r} not found")
+        # Get the tool first to fail fast if it doesn't exist
+        tools = await self.get_tools()
 
-            try:
-                return await tool.run(arguments)
-
-            # raise ToolErrors as-is
-            except ToolError as e:
-                logger.exception(f"Error calling tool {key!r}")
-                raise e
-
-            # Handle other exceptions
-            except Exception as e:
-                logger.exception(f"Error calling tool {key!r}")
-                if self.mask_error_details:
-                    # Mask internal details
-                    raise ToolError(f"Error calling tool {key!r}") from e
-                else:
-                    # Include original error details
-                    raise ToolError(f"Error calling tool {key!r}: {e}") from e
-
-        # 2. Check mounted servers using the filtered protocol path.
-        for mounted in reversed(self._mounted_servers):
-            tool_key = key
-            if mounted.prefix:
-                if key.startswith(f"{mounted.prefix}_"):
-                    tool_key = key.removeprefix(f"{mounted.prefix}_")
-                else:
+        if name not in tools:
+            # Try looking through mounted servers
+            for mounted in reversed(self._mounted_servers):
+                try:
+                    # Check if this server handles the tool
+                    result = await mounted.server._mcp_call_tool(
+                        key=name,
+                        arguments=arguments or {},
+                    )
+                    return result
+                except Exception:
                     continue
-            try:
-                return await mounted.server._call_tool(tool_key, arguments)
-            except NotFoundError:
-                continue
 
-        raise NotFoundError(f"Tool {key!r} not found.")
+            # Tool not found anywhere
+            raise ToolError(f"Unknown tool: {name}")
+
+        # Call the local tool
+        result = await self.call_tool(key=name, arguments=arguments)
+
+        # Format the result for MCP
+        return result.to_mcp_result()

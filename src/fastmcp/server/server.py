@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import re
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -49,7 +50,7 @@ from fastmcp.prompts import Prompt, PromptManager
 from fastmcp.prompts.prompt import FunctionPrompt
 from fastmcp.resources import Resource, ResourceManager
 from fastmcp.resources.template import ResourceTemplate
-from fastmcp.server.auth.auth import AuthProvider
+from fastmcp.server.auth import AuthProvider
 from fastmcp.server.auth.registry import get_registered_provider
 from fastmcp.server.http import (
     StarletteWithLifespan,
@@ -172,6 +173,7 @@ class FastMCP(Generic[LifespanResultT]):
         )
 
         self._additional_http_routes: list[BaseRoute] = []
+        self._mounted_servers: list[MountedServer] = []
         self._tool_manager = ToolManager(
             duplicate_behavior=on_duplicate_tools,
             mask_error_details=mask_error_details,
@@ -221,7 +223,24 @@ class FastMCP(Generic[LifespanResultT]):
 
         # Set up MCP protocol handlers
         self._setup_handlers()
-        self.dependencies = dependencies or fastmcp.settings.server_dependencies
+
+        # Handle dependencies with deprecation warning
+        # TODO: Remove dependencies parameter (deprecated in v2.11.4)
+        if dependencies is not None:
+            import warnings
+
+            warnings.warn(
+                "The 'dependencies' parameter is deprecated as of FastMCP 2.11.4 and will be removed in a future version. "
+                "Please specify dependencies in a fastmcp.json configuration file instead:\n"
+                '{\n  "entrypoint": "your_server.py",\n  "environment": {\n    "dependencies": '
+                f"{json.dumps(dependencies)}\n  }}\n}}\n"
+                "See https://gofastmcp.com/docs/deployment/server-configuration for more information.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self.dependencies = (
+            dependencies or fastmcp.settings.server_dependencies
+        )  # TODO: Remove (deprecated in v2.11.4)
 
         self.include_fastmcp_meta = (
             include_fastmcp_meta
@@ -444,7 +463,7 @@ class FastMCP(Generic[LifespanResultT]):
         Request and returns a Response.
 
         Args:
-            path: URL path for the route (e.g., "/oauth/callback")
+            path: URL path for the route (e.g., "/auth/callback")
             methods: List of HTTP methods to support (e.g., ["GET", "POST"])
             name: Optional name for the route (to reference this route with
                 Starlette's reverse URL lookup feature)
@@ -474,6 +493,24 @@ class FastMCP(Generic[LifespanResultT]):
             return fn
 
         return decorator
+
+    def _get_additional_http_routes(self) -> list[BaseRoute]:
+        """Get all additional HTTP routes including from mounted servers.
+
+        Returns a list of all custom HTTP routes from this server and
+        recursively from all mounted servers.
+
+        Returns:
+            List of Starlette BaseRoute objects
+        """
+        routes = list(self._additional_http_routes)
+
+        # Recursively get routes from mounted servers
+        for mounted_server in self._mounted_servers:
+            mounted_routes = mounted_server.server._get_additional_http_routes()
+            routes.extend(mounted_routes)
+
+        return routes
 
     async def _mcp_list_tools(self) -> list[MCPTool]:
         logger.debug("Handler called: list_tools")
@@ -736,10 +773,16 @@ class FastMCP(Generic[LifespanResultT]):
                 raise NotFoundError(f"Unknown resource: {str(context.message.uri)!r}")
 
             content = await self._resource_manager.read_resource(context.message.uri)
+
+            # Automatically detect mime_type for dict/list content
+            mime_type = resource.mime_type
+            if isinstance(content, dict | list) and mime_type == "text/plain":
+                mime_type = "application/json"
+
             return [
                 ReadResourceContents(
                     content=content,
-                    mime_type=resource.mime_type,
+                    mime_type=mime_type,
                 )
             ]
 
@@ -1796,6 +1839,7 @@ class FastMCP(Generic[LifespanResultT]):
             server=server,
             resource_prefix_format=self.resource_prefix_format,
         )
+        self._mounted_servers.append(mounted_server)
         self._tool_manager.mount(mounted_server)
         self._resource_manager.mount(mounted_server)
         self._prompt_manager.mount(mounted_server)
@@ -1891,7 +1935,7 @@ class FastMCP(Generic[LifespanResultT]):
         # Import tools from the server
         for key, tool in (await server.get_tools()).items():
             if prefix:
-                tool = tool.with_key(f"{prefix}_{key}")
+                tool = tool.model_copy(update={"key": f"{prefix}_{key}"})
             self._tool_manager.add_tool(tool)
 
         # Import resources and templates from the server
@@ -1900,7 +1944,12 @@ class FastMCP(Generic[LifespanResultT]):
                 resource_key = add_resource_prefix(
                     key, prefix, self.resource_prefix_format
                 )
-                resource = resource.with_key(resource_key)
+                resource = resource.model_copy(
+                    update={
+                        "name": f"{prefix}_{resource.name}",
+                        "key": resource_key,
+                    }
+                )
             self._resource_manager.add_resource(resource)
 
         for key, template in (await server.get_resource_templates()).items():
@@ -1908,13 +1957,18 @@ class FastMCP(Generic[LifespanResultT]):
                 template_key = add_resource_prefix(
                     key, prefix, self.resource_prefix_format
                 )
-                template = template.with_key(template_key)
+                template = template.model_copy(
+                    update={
+                        "name": f"{prefix}_{template.name}",
+                        "key": template_key,
+                    }
+                )
             self._resource_manager.add_template(template)
 
         # Import prompts from the server
         for key, prompt in (await server.get_prompts()).items():
             if prefix:
-                prompt = prompt.with_key(f"{prefix}_{key}")
+                prompt = prompt.model_copy(update={"key": f"{prefix}_{key}"})
             self._prompt_manager.add_prompt(prompt)
 
         if prefix:

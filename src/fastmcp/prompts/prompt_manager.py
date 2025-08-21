@@ -1,4 +1,6 @@
-from __future__ import annotations as _annotations
+"""Refactored PromptManager using BaseManager."""
+
+from __future__ import annotations
 
 import warnings
 from collections.abc import Awaitable, Callable
@@ -7,9 +9,9 @@ from typing import TYPE_CHECKING, Any
 from mcp import GetPromptResult
 
 from fastmcp import settings
-from fastmcp.exceptions import NotFoundError, PromptError
+from fastmcp.base_manager import BaseManager
+from fastmcp.exceptions import PromptError
 from fastmcp.prompts.prompt import FunctionPrompt, Prompt, PromptResult
-from fastmcp.settings import DuplicateBehavior
 from fastmcp.utilities.logging import get_logger
 
 if TYPE_CHECKING:
@@ -18,184 +20,136 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-class PromptManager:
+class PromptManager(BaseManager[Prompt]):
     """Manages FastMCP prompts."""
 
-    def __init__(
-        self,
-        duplicate_behavior: DuplicateBehavior | None = None,
-        mask_error_details: bool | None = None,
-    ):
-        self._prompts: dict[str, Prompt] = {}
-        self._mounted_servers: list[MountedServer] = []
-        self.mask_error_details = mask_error_details or settings.mask_error_details
+    def get_item_type_name(self) -> str:
+        return "prompt"
 
-        # Default to "warn" if None is provided
-        if duplicate_behavior is None:
-            duplicate_behavior = "warn"
+    def get_item_type_plural(self) -> str:
+        return "prompts"
 
-        if duplicate_behavior not in DuplicateBehavior.__args__:
-            raise ValueError(
-                f"Invalid duplicate_behavior: {duplicate_behavior}. "
-                f"Must be one of: {', '.join(DuplicateBehavior.__args__)}"
+    async def fetch_items_from_mounted_server(
+        self, server: Any, via_server: bool
+    ) -> list[Prompt]:
+        if via_server:
+            # Use the server-to-server filtered path
+            return await server._list_prompts()
+        else:
+            # Use the manager-to-manager unfiltered path
+            return await server._prompt_manager.list_prompts()
+
+    def get_item_key(self, item: Prompt) -> str:
+        return item.key
+
+    def apply_prefix_to_items(
+        self, items: dict[str, Prompt], mounted: MountedServer
+    ) -> dict[str, Prompt]:
+        prefixed_prompts = {}
+        for prompt in items.values():
+            prefixed_prompt = prompt.model_copy(
+                update={"key": f"{mounted.prefix}_{prompt.key}"}
             )
-
-        self.duplicate_behavior = duplicate_behavior
-
-    def mount(self, server: MountedServer) -> None:
-        """Adds a mounted server as a source for prompts."""
-        self._mounted_servers.append(server)
-
-    async def _load_prompts(self, *, via_server: bool = False) -> dict[str, Prompt]:
-        """
-        The single, consolidated recursive method for fetching prompts. The 'via_server'
-        parameter determines the communication path.
-
-        - via_server=False: Manager-to-manager path for complete, unfiltered inventory
-        - via_server=True: Server-to-server path for filtered MCP requests
-        """
-        all_prompts: dict[str, Prompt] = {}
-
-        for mounted in self._mounted_servers:
-            try:
-                if via_server:
-                    # Use the server-to-server filtered path
-                    child_results = await mounted.server._list_prompts()
-                else:
-                    # Use the manager-to-manager unfiltered path
-                    child_results = await mounted.server._prompt_manager.list_prompts()
-
-                # The combination logic is the same for both paths
-                child_dict = {p.key: p for p in child_results}
-                if mounted.prefix:
-                    for prompt in child_dict.values():
-                        prefixed_prompt = prompt.with_key(
-                            f"{mounted.prefix}_{prompt.key}"
-                        )
-                        all_prompts[prefixed_prompt.key] = prefixed_prompt
-                else:
-                    all_prompts.update(child_dict)
-            except Exception as e:
-                # Skip failed mounts silently, matches existing behavior
-                logger.warning(
-                    f"Failed to get prompts from server: {mounted.server.name!r}, mounted at: {mounted.prefix!r}: {e}"
-                )
-                continue
-
-        # Finally, add local prompts, which always take precedence
-        all_prompts.update(self._prompts)
-        return all_prompts
+            prefixed_prompts[prefixed_prompt.key] = prefixed_prompt
+        return prefixed_prompts
 
     async def has_prompt(self, key: str) -> bool:
         """Check if a prompt exists."""
-        prompts = await self.get_prompts()
-        return key in prompts
+        return await self.has_item(key)
 
     async def get_prompt(self, key: str) -> Prompt:
         """Get prompt by key."""
-        prompts = await self.get_prompts()
-        if key in prompts:
-            return prompts[key]
-        raise NotFoundError(f"Unknown prompt: {key}")
+        return await self.get_item(key)
 
     async def get_prompts(self) -> dict[str, Prompt]:
-        """
-        Gets the complete, unfiltered inventory of all prompts.
-        """
-        return await self._load_prompts(via_server=False)
+        """Get all registered prompts, keyed by name."""
+        return await self.get_items()
 
     async def list_prompts(self) -> list[Prompt]:
-        """
-        Lists all prompts, applying protocol filtering.
-        """
-        prompts_dict = await self._load_prompts(via_server=True)
-        return list(prompts_dict.values())
+        """List all prompts (used for MCP list requests)."""
+        return await self.list_items()
 
     def add_prompt_from_fn(
         self,
-        fn: Callable[..., PromptResult | Awaitable[PromptResult]],
+        fn: Callable[..., Awaitable[PromptResult] | PromptResult | str],
         name: str | None = None,
         description: str | None = None,
         tags: set[str] | None = None,
-    ) -> FunctionPrompt:
-        """Create a prompt from a function."""
-        # deprecated in 2.7.0
+    ) -> Prompt:
+        """Create a prompt from a function and add it to the manager."""
         if settings.deprecation_warnings:
             warnings.warn(
-                "PromptManager.add_prompt_from_fn() is deprecated. Use Prompt.from_function() and call add_prompt() instead.",
+                "PromptManager.add_prompt_from_fn() is deprecated. "
+                "Use FunctionPrompt.from_function() and call add_prompt() instead.",
                 DeprecationWarning,
                 stacklevel=2,
             )
+
         prompt = FunctionPrompt.from_function(
-            fn, name=name, description=description, tags=tags
+            fn=fn,
+            name=name,
+            description=description,
+            tags=tags,
         )
-        return self.add_prompt(prompt)  # type: ignore
+        return self.add_prompt(prompt)
 
     def add_prompt(self, prompt: Prompt) -> Prompt:
-        """Add a prompt to the manager."""
-        # Check for duplicates
-        existing = self._prompts.get(prompt.key)
-        if existing:
-            if self.duplicate_behavior == "warn":
-                logger.warning(f"Prompt already exists: {prompt.key}")
-                self._prompts[prompt.key] = prompt
-            elif self.duplicate_behavior == "replace":
-                self._prompts[prompt.key] = prompt
-            elif self.duplicate_behavior == "error":
-                raise ValueError(f"Prompt already exists: {prompt.key}")
-            elif self.duplicate_behavior == "ignore":
-                return existing
-        else:
-            self._prompts[prompt.key] = prompt
-        return prompt
+        """Register a prompt with the server."""
+        return self.add_item(prompt)
 
     async def render_prompt(
         self,
         name: str,
         arguments: dict[str, Any] | None = None,
     ) -> GetPromptResult:
-        """
-        Internal API for servers: Finds and renders a prompt, respecting the
-        filtered protocol path.
-        """
-        # 1. Check local prompts first. The server will have already applied its filter.
-        if name in self._prompts:
-            prompt = await self.get_prompt(name)
-            if not prompt:
-                raise NotFoundError(f"Unknown prompt: {name}")
+        """Render a prompt (alias for get_prompt_result for compatibility)."""
+        return await self.get_prompt_result(name, arguments)
 
-            try:
-                messages = await prompt.render(arguments)
-                return GetPromptResult(
-                    description=prompt.description, messages=messages
-                )
+    async def get_prompt_result(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> GetPromptResult:
+        """Get a prompt result by name and arguments."""
+        prompt = await self.get_prompt(name)
 
-            # Pass through PromptErrors as-is
-            except PromptError as e:
-                logger.exception(f"Error rendering prompt {name!r}")
-                raise e
+        try:
+            messages = await prompt.render(arguments or {})
+            return GetPromptResult(
+                description=prompt.description,
+                messages=messages,
+            )
+        except PromptError:
+            raise
+        except Exception as e:
+            if self.mask_error_details:
+                raise PromptError(f"Error getting prompt {name!r}")
+            else:
+                raise PromptError(f"Error getting prompt {name!r}: {e}") from e
 
-            # Handle other exceptions
-            except Exception as e:
-                logger.exception(f"Error rendering prompt {name!r}")
-                if self.mask_error_details:
-                    # Mask internal details
-                    raise PromptError(f"Error rendering prompt {name!r}") from e
-                else:
-                    # Include original error details
-                    raise PromptError(f"Error rendering prompt {name!r}: {e}") from e
+    async def handle_get_prompt_request(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> GetPromptResult:
+        """Handle an MCP prompts/get request."""
+        # First try local processing
+        prompts = await self.get_prompts()
 
-        # 2. Check mounted servers using the filtered protocol path.
+        if name in prompts:
+            return await self.get_prompt_result(name, arguments)
+
+        # If not found locally, try mounted servers
         for mounted in reversed(self._mounted_servers):
-            prompt_key = name
-            if mounted.prefix:
-                if name.startswith(f"{mounted.prefix}_"):
-                    prompt_key = name.removeprefix(f"{mounted.prefix}_")
-                else:
-                    continue
             try:
-                return await mounted.server._get_prompt(prompt_key, arguments)
-            except NotFoundError:
+                # Check if this server handles the prompt
+                result = await mounted.server._mcp_get_prompt(
+                    name=name,
+                    arguments=arguments or {},
+                )
+                return result
+            except Exception:
                 continue
 
-        raise NotFoundError(f"Unknown prompt: {name}")
+        # Prompt not found anywhere
+        raise PromptError(f"Unknown prompt: {name}")
